@@ -2,6 +2,7 @@ package configs
 
 import (
 	"go.temporal.io/server/chasm/lib/callback"
+	"go.temporal.io/server/chasm/lib/nexusoperation"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/namespace"
@@ -69,13 +70,17 @@ type Config struct {
 	MaxCallbacksPerExecution              dynamicconfig.IntPropertyFnWithNamespaceFilter
 	MaxCallbacksPerUpdateID               dynamicconfig.IntPropertyFnWithNamespaceFilter
 	EnableChasm                           dynamicconfig.BoolPropertyFnWithNamespaceFilter
-	EnableCHASMCallbacks                  dynamicconfig.BoolPropertyFnWithNamespaceFilter
-	EnableCHASMSignalBacklinks            dynamicconfig.BoolPropertyFnWithNamespaceFilter
-	EnableWorkflowUpdateCallbacks         dynamicconfig.BoolPropertyFnWithNamespaceFilter
-	ChasmMaxInMemoryPureTasks             dynamicconfig.IntPropertyFn
-	EnableCHASMSchedulerCreation          dynamicconfig.BoolPropertyFnWithNamespaceFilter
-	EnableCHASMSchedulerMigration         dynamicconfig.BoolPropertyFnWithNamespaceFilter
-	ExternalPayloadsEnabled               dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	// EnableChasmNexusWorkflowOperations controls whether newly scheduled Nexus operations are backed
+	// by the CHASM tree (true) or the legacy HSM tree (false). Workflow reset reads this to decide
+	// which tree to (re)create the operation in, realigning to the current creation policy.
+	EnableChasmNexusWorkflowOperations dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	EnableCHASMCallbacks               dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	EnableCHASMSignalBacklinks         dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	EnableWorkflowUpdateCallbacks      dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	ChasmMaxInMemoryPureTasks          dynamicconfig.IntPropertyFn
+	EnableCHASMSchedulerCreation       dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	EnableCHASMSchedulerMigration      dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	ExternalPayloadsEnabled            dynamicconfig.BoolPropertyFnWithNamespaceFilter
 
 	// EventsCache settings
 	// Change of these configs require shard restart
@@ -493,6 +498,7 @@ func NewConfig(
 		MaxCallbacksPerExecution:              callback.MaxPerExecution.Get(dc),
 		MaxCallbacksPerUpdateID:               dynamicconfig.MaxCallbacksPerUpdateID.Get(dc),
 		EnableChasm:                           dynamicconfig.EnableChasm.Get(dc),
+		EnableChasmNexusWorkflowOperations:    nexusoperation.EnableChasmWorkflowOperations.Get(dc),
 		ChasmMaxInMemoryPureTasks:             dynamicconfig.ChasmMaxInMemoryPureTasks.Get(dc),
 
 		EnableCHASMSchedulerCreation:  dynamicconfig.EnableCHASMSchedulerCreation.Get(dc),

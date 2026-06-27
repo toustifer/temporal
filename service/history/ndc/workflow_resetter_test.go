@@ -959,7 +959,7 @@ func (s *workflowResetterSuite) TestReapplyEvents_WithPendingChildren() {
 
 		for _, tc := range testcases {
 			s.Run(tc.name+" "+tcReset.name, func() {
-				_, err := reapplyEvents(context.Background(), mutableState, nil, nil, tc.events, nil, "", tcReset.isReset)
+				_, err := reapplyEvents(context.Background(), mutableState, nil, nil, nil, tc.events, nil, "", tcReset.isReset)
 				s.NoError(err)
 			})
 		}
@@ -1026,7 +1026,7 @@ func (s *workflowResetterSuite) TestReapplyEvents_WithNoPendingChildren() {
 
 		for _, tc := range testCases {
 			s.Run(tc.name+" "+tcReset.name, func() {
-				_, err := reapplyEvents(context.Background(), mutableState, nil, nil, tc.events, nil, "", tcReset.isReset)
+				_, err := reapplyEvents(context.Background(), mutableState, nil, nil, nil, tc.events, nil, "", tcReset.isReset)
 				s.NoError(err)
 			})
 		}
@@ -1261,7 +1261,7 @@ func (s *workflowResetterSuite) TestReapplyEvents() {
 				}
 			}
 
-			appliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, events, nil, "", tc.isReset)
+			appliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, nil, events, nil, "", tc.isReset)
 			s.NoError(err)
 
 			s.Equal(tc.expected, appliedEvents)
@@ -1332,7 +1332,7 @@ func (s *workflowResetterSuite) TestReapplyEvents_Excludes() {
 		enumspb.RESET_REAPPLY_EXCLUDE_TYPE_UPDATE: {},
 		enumspb.RESET_REAPPLY_EXCLUDE_TYPE_NEXUS:  {},
 	}
-	reappliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, events, excludes, "", false)
+	reappliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, nil, events, excludes, "", false)
 	s.Empty(reappliedEvents)
 	s.NoError(err)
 
@@ -1358,7 +1358,7 @@ func (s *workflowResetterSuite) TestReapplyEvents_Excludes() {
 		},
 	}
 	events = append(events, event7, event8)
-	reappliedEvents, err = reapplyEvents(context.Background(), ms, nil, smReg, events, excludes, "", true)
+	reappliedEvents, err = reapplyEvents(context.Background(), ms, nil, smReg, nil, events, excludes, "", true)
 	s.Empty(reappliedEvents)
 	s.NoError(err)
 }
@@ -1653,7 +1653,7 @@ func (s *workflowResetterSuite) TestReapplyEvents_WorkflowOptionsUpdated_Complet
 			events := []*historypb.HistoryEvent{event}
 
 			// Call reapplyEvents and expect an error
-			appliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, events, nil, "", true)
+			appliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, nil, events, nil, "", true)
 			s.Error(err)
 			s.Contains(err.Error(), tc.expectedErrorContains)
 			s.Empty(appliedEvents)
@@ -1701,7 +1701,7 @@ func (s *workflowResetterSuite) TestReapplyEvents_WorkflowOptionsUpdated_Complet
 	events := []*historypb.HistoryEvent{event}
 
 	// Call reapplyEvents - should skip the event (no error, no applied events)
-	appliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, events, nil, "", true)
+	appliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, nil, events, nil, "", true)
 	s.NoError(err)
 	s.Empty(appliedEvents) // Event should be skipped
 }
@@ -1739,7 +1739,7 @@ func (s *workflowResetterSuite) TestReapplyEvents_WorkflowOptionsUpdated_WithTim
 		attr.GetWorkflowUpdateOptions(),
 	).Return(&historypb.HistoryEvent{}, nil)
 
-	appliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, []*historypb.HistoryEvent{event}, nil, "", true)
+	appliedEvents, err := reapplyEvents(context.Background(), ms, nil, smReg, nil, []*historypb.HistoryEvent{event}, nil, "", true)
 	s.NoError(err)
 	s.Len(appliedEvents, 1)
 }

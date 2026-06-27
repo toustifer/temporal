@@ -54,6 +54,7 @@ func (s *nDCEventReapplicationSuite) SetupTest() {
 	metricsHandler := metrics.NoopMetricsHandler
 	s.nDCReapplication = NewEventsReapplier(
 		hsm.NewRegistry(),
+		nil,
 		metricsHandler,
 		logger,
 	)

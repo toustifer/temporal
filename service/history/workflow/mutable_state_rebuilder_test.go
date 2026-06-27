@@ -12,14 +12,17 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/backoff"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/definition"
+	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/payload"
@@ -2184,10 +2187,61 @@ func (s *stateBuilderSuite) TestApplyEvents_HSMRegistry() {
 	}
 	s.mockMutableState.EXPECT().ClearStickyTaskQueue()
 	s.mockUpdateVersion(event)
+	// CHASM disabled -> the create event is routed to the HSM tree (legacy behavior).
+	s.mockMutableState.EXPECT().ChasmEnabled().Return(false).AnyTimes()
 
 	_, err := s.stateRebuilder.ApplyEvents(context.Background(), tests.NamespaceID, requestID, execution, s.toHistory(event), nil, "")
 	s.NoError(err)
 	// Verify the event was applied.
+	sm, err := nexusoperations.MachineCollection(s.mockMutableState.HSM()).Data("5")
+	s.NoError(err)
+	s.Equal(enumsspb.NEXUS_OPERATION_STATE_SCHEDULED, sm.State())
+}
+
+// TestApplyEvents_NexusScheduled_ChasmCreateFallsBackToHSM verifies that when the creation-policy
+// flag is ON but creating the op in the CHASM tree fails, rebuild falls back to creating the op in
+// the HSM tree rather than failing the whole rebuild (rollout resilience).
+func (s *stateBuilderSuite) TestApplyEvents_NexusScheduled_ChasmCreateFallsBackToHSM() {
+	version := int64(1)
+	requestID := uuid.NewString()
+	execution := &commonpb.WorkflowExecution{
+		WorkflowId: "wf-id",
+		RunId:      tests.RunID,
+	}
+	event := &historypb.HistoryEvent{
+		TaskId:    rand.Int63(),
+		Version:   version,
+		EventId:   5,
+		EventTime: timestamppb.New(time.Now().UTC()),
+		EventType: enumspb.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED,
+		Attributes: &historypb.HistoryEvent_NexusOperationScheduledEventAttributes{
+			NexusOperationScheduledEventAttributes: &historypb.NexusOperationScheduledEventAttributes{
+				EndpointId:                   "endpoint-id",
+				Endpoint:                     "endpoint",
+				Service:                      "service",
+				Operation:                    "operation",
+				WorkflowTaskCompletedEventId: 4,
+				RequestId:                    "request-id",
+			},
+		},
+	}
+
+	// Flag ON + a non-nil CHASM workflow registry so the create attempts the CHASM tree first.
+	s.mockShard.GetConfig().EnableChasmNexusWorkflowOperations = dynamicconfig.GetBoolPropertyFnFilteredByNamespace(true)
+	s.mockShard.SetChasmWorkflowRegistry(chasmworkflow.NewRegistry())
+
+	s.mockMutableState.EXPECT().ClearStickyTaskQueue()
+	s.mockUpdateVersion(event)
+	s.mockMutableState.EXPECT().ChasmEnabled().Return(true).AnyTimes()
+	s.mockMutableState.EXPECT().GetNamespaceEntry().Return(tests.GlobalNamespaceEntry).AnyTimes()
+	s.mockMutableState.EXPECT().EnsureChasmWorkflowComponent(gomock.Any()).AnyTimes()
+	// Force the CHASM create to fail so the HSM fallback path is taken.
+	s.mockMutableState.EXPECT().ChasmWorkflowComponent(gomock.Any()).
+		Return(nil, nil, serviceerror.NewInternal("chasm unavailable")).AnyTimes()
+
+	_, err := s.stateRebuilder.ApplyEvents(context.Background(), tests.NamespaceID, requestID, execution, s.toHistory(event), nil, "")
+	s.NoError(err)
+	// The op must have been created in the HSM tree by the fallback.
 	sm, err := nexusoperations.MachineCollection(s.mockMutableState.HSM()).Data("5")
 	s.NoError(err)
 	s.Equal(enumsspb.NEXUS_OPERATION_STATE_SCHEDULED, sm.State())

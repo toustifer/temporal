@@ -231,6 +231,17 @@ func (h *nexusCompletionHandler) CompleteOperation(ctx context.Context, r *nexus
 		return nexus.NewHandlerErrorf(nexus.HandlerErrorTypeBadRequest, "invalid completion state")
 	}
 
+	// Cross-tree probe-and-fallback (handled SERVER-SIDE in History).
+	//
+	// A Nexus operation can be backed by EITHER the HSM tree or the CHASM tree, and a workflow reset
+	// can move an op's backing rail (rebuild routes op creation by the current creation-policy flag;
+	// see mutable_state_rebuilder.go). So a completion token's native framework may no longer contain
+	// the op. The frontend remains a pure router by token type; the cross-tree fallback lives in
+	// History, which has the engines + registries (and can distinguish "execution not found" from "op
+	// not found in this tree" — a distinction not available here, so doing the fallback at the frontend
+	// would over-trigger on wrong-run/wrong-workflow tokens):
+	//   - HSM token   -> CompleteNexusOperation falls back to the CHASM op (handler.go).
+	//   - CHASM token -> CompleteNexusOperationChasm falls back to the HSM op (handler.go).
 	if len(completion.GetComponentRef()) > 0 {
 		err = h.completeChasmOperation(ctx, logger, completion, successPayload, r, links)
 	} else {

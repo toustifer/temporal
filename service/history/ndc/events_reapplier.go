@@ -8,6 +8,7 @@ import (
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/serviceerror"
 	enumsspb "go.temporal.io/server/api/enums/v1"
+	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/service/history/hsm"
@@ -27,22 +28,25 @@ type (
 	}
 
 	EventsReapplierImpl struct {
-		stateMachineRegistry *hsm.Registry
-		metricsHandler       metrics.Handler
-		logger               log.Logger
+		stateMachineRegistry  *hsm.Registry
+		chasmWorkflowRegistry *chasmworkflow.Registry
+		metricsHandler        metrics.Handler
+		logger                log.Logger
 	}
 )
 
 func NewEventsReapplier(
 	stateMachineRegistry *hsm.Registry,
+	chasmWorkflowRegistry *chasmworkflow.Registry,
 	metricsHandler metrics.Handler,
 	logger log.Logger,
 ) *EventsReapplierImpl {
 
 	return &EventsReapplierImpl{
-		stateMachineRegistry: stateMachineRegistry,
-		metricsHandler:       metricsHandler,
-		logger:               logger,
+		stateMachineRegistry:  stateMachineRegistry,
+		chasmWorkflowRegistry: chasmWorkflowRegistry,
+		metricsHandler:        metricsHandler,
+		logger:                logger,
 	}
 }
 
@@ -57,7 +61,12 @@ func (r *EventsReapplierImpl) ReapplyEvents(
 	if !ms.IsWorkflowExecutionRunning() {
 		return nil, serviceerror.NewInternal("unable to reapply events to closed workflow.")
 	}
-	reappliedEvents, err := reapplyEvents(ctx, ms, updateRegistry, r.stateMachineRegistry, historyEvents, nil, runID, false)
+	// Nexus operation events can reach reapplyEvents' default case on this (replication / current-run
+	// reapply) path: the event filter in workflow.shouldReapplyEvent admits any HSM-registered event
+	// (which includes all Nexus operation events), and the case-1.a caller in transaction_manager.go
+	// passes events through unfiltered. So we plumb the real CHASM workflow registry here to get the
+	// same HSM<->CHASM fallback used by workflow reset, ensuring CHASM-backed Nexus ops are reapplied.
+	reappliedEvents, err := reapplyEvents(ctx, ms, updateRegistry, r.stateMachineRegistry, r.chasmWorkflowRegistry, historyEvents, nil, runID, false)
 	if err != nil {
 		return nil, err
 	}

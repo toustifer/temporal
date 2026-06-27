@@ -10,6 +10,7 @@ import (
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
+	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
 	"go.temporal.io/server/common/archiver"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/cluster"
@@ -117,6 +118,12 @@ type (
 		GetFinalizer() *finalizer.Finalizer
 
 		ChasmRegistry() *chasm.Registry
+		// ChasmWorkflowRegistry returns the CHASM workflow library's event/command registry.
+		// This is distinct from ChasmRegistry (the top-level component/task registry): it maps
+		// history event types to CHASM EventDefinitions so that CHASM-backed components (e.g. Nexus
+		// operations living in the CHASM tree) can have their events applied/cherry-picked during
+		// replication and workflow reset.
+		ChasmWorkflowRegistry() *chasmworkflow.Registry
 		EndpointRegistry() chasm.EndpointRegistry
 
 		BusinessIDReuseRateLimiter(namespaceID namespace.ID, businessID string, archetypeID chasm.ArchetypeID) quotas.RateLimiter

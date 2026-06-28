@@ -1,0 +1,580 @@
+# agentflow — Lightweight Temporal Engine for agent-company
+
+## 一、总览
+
+agentflow 是一个介于 agent-company（多 Agent 编排层）和持久化+协作层之间的**本地状态机服务**。它拿掉 Temporal Server 的 gRPC、membership、分片、多 backend 等分布式负担，只保留**定时的中间状态机核心**，对外暴露两个接口：
+
+- **Go Engine API**（`pkg/engine/`）—— 供其他 Go 代码内嵌调用
+- **MCP stdio Server**（`pkg/server/`）—— 供 agent-company 的 Leader/Worker 通过 MCP 协议调用
+
+### 架构定位
+
+```
+agent-company (Leader/Worker)
+    │  MCP calls (stdio)
+    ▼
+┌─────────────────────────────────┐
+│  agentflow                      │
+│  ┌───────────────────────────┐  │
+│  │  MCP Server (pkg/server/) │  │
+│  │  stdio JSON-RPC 2.0       │  │
+│  └────────┬──────────────────┘  │
+│           │                     │
+│  ┌────────▼──────────────────┐  │
+│  │  Engine (pkg/engine/)     │  │
+│  │  CreateResource           │  │
+│  │  TransitionResource       │  │
+│  │  GetResource              │  │
+│  │  GetHistory               │  │
+│  │  SyncToHub (可选)          │  │
+│  └────────┬──────────────────┘  │
+│           │                     │
+│  ┌────────▼──────────────────┐  │
+│  │  Temporal Kernel          │  │
+│  │  ExecutionStore           │  │
+│  │  HSM state machine        │  │
+│  │  SQLite (内存/文件)        │  │
+│  └───────────────────────────┘  │
+└─────────────────────────────────┘
+    │  (可选) HTTP sync
+    ▼
+agent-hub (多人协作)
+```
+
+### 核心原则
+
+1. **本地优先**：所有状态先写 SQLite，操作不依赖外部服务
+2. **MCP 原生**：对 agent-company 暴露 MCP stdio 接口，而不是 REST/gRPC
+3. **Temporal 内核**：复用 Temporal 的 HSM 状态机和 ExecutionStore 持久化
+4. **Hub 可选**：agent-hub 只是同步终点，不是运行时依赖
+5. **最小状态集**：只暴露 agent-company 需要的 4 个操作，不把整个 Temporal API 搬过来
+
+---
+
+## 二、核心概念映射
+
+agent-company 的 .mycompany/leader.json 状态模型需要映射到 Temporal 的资源模型。
+
+| agent-company 概念 | Temporal 概念 | 说明 |
+|---|---|---|
+| `dag[]` 中的单个 task | `WorkflowExecution` | 每个 task 是一个 Temporal Workflow |
+| task 的 lifecycle 状态 | `StateMachine.State` | `pending / in_progress / completed` 等 |
+| task 的状态流转 | `StateMachine.Transition` | `assigned → executing → review_pending → done` |
+| task 的变更记录 | `Event History` | Temporal 自动记录所有 transition |
+| DAG 整体 | `Namespace` 或 `Workflow` | 一组关联的 task 共享同一 context |
+| worker 会话实例 | `workerAgentId` | MCP 层记录的当前 agent 实例 id |
+| resume context | `Memo` / `SearchAttributes` | 存在 workflow 上的键值 metadata |
+
+### 资源类型
+
+agentflow 定义自己的资源类型，**不完全照搬 Temporal 的 Workflow/Activity 语义**。因为 agent-company 的场景比微服务编排要轻得多。
+
+```go
+type ResourceType string
+
+const (
+    ResourceNamespace ResourceType = "namespace"  // 业务域/项目
+    ResourceTask      ResourceType = "task"        // 单个 DAG task
+)
+```
+
+- 一个 `namespace` 对应一次 session，包含该 session 的配置和元数据
+- 一个 `task` 对应 leader.json 里的一行，包含 lifecycle、属主、验收标准
+- 所有 `task` 共享同一组 event history 搜索能力
+
+---
+
+## 三、Engine 层（pkg/engine/）
+
+### 3.1 职责
+
+- 初始化 Temporal SQLite 持久化和 HSM 注册
+- 提供事务性的资源 CRUD 和状态转换
+- 自动记录每次转换到 event history
+- 暴露最小接口，不暴露 Temporal 的内部复杂度
+
+### 3.2 核心接口
+
+```go
+package engine
+
+// Engine is the core state machine engine.
+// All methods are transactional.
+type Engine struct {
+    // unexported: ExecutionStore, Serializer, HSM Registry
+}
+
+// ── Namespace operations ──────────────────────────
+
+// CreateNamespace creates a new namespace (business domain / session).
+// Returns the namespace ID.
+func (e *Engine) CreateNamespace(ctx context.Context, req CreateNamespaceRequest) (*Namespace, error)
+
+// GetNamespace retrieves a namespace by ID.
+func (e *Engine) GetNamespace(ctx context.Context, nsID string) (*Namespace, error)
+
+// ListNamespaces lists all namespaces (active sessions).
+func (e *Engine) ListNamespaces(ctx context.Context) ([]Namespace, error)
+
+// ── Task operations ───────────────────────────────
+
+// CreateTask creates a new task in the given namespace.
+// Equivalent to adding a new entry to leader.json dag[].
+func (e *Engine) CreateTask(ctx context.Context, req CreateTaskRequest) (*Task, error)
+
+// TransitionTask advances a task's state machine.
+// The transition is validated: invalid transitions are rejected.
+// On success, the event is appended to history.
+// Parameters: (namespaceID, taskID, transition, metadata)
+func (e *Engine) TransitionTask(ctx context.Context, nsID, taskID string, t TaskTransition, meta map[string]string) (*Task, error)
+
+// GetTask retrieves the current state of a task.
+func (e *Engine) GetTask(ctx context.Context, nsID, taskID string) (*Task, error)
+
+// ListTasks lists all tasks in a namespace, optionally filtered by state.
+func (e *Engine) ListTasks(ctx context.Context, nsID string, filter StateFilter) ([]Task, error)
+
+// GetHistory retrieves the event history for a task.
+func (e *Engine) GetHistory(ctx context.Context, nsID, taskID string) ([]Event, error)
+
+// ── Lifecycle ─────────────────────────────────────
+
+// Close cleanly shuts down the engine and its persistence connections.
+func (e *Engine) Close() error
+```
+
+### 3.3 Task 数据模型
+
+```go
+type Task struct {
+    ID               string            `json:"id"`     // taskId (e.g. "T1")
+    NamespaceID      string            `json:"namespace_id"`
+    Title            string            `json:"title"`
+    Description      string            `json:"description"`
+    State            TaskState         `json:"state"`  // current lifecycle
+    AssignedWorker   string            `json:"assigned_worker"`
+    AcceptanceCrieria []string          `json:"acceptance_criteria"`
+    OutputFiles      []string          `json:"output_files"`
+    WorkerAgentID    string            `json:"worker_agent_id,omitempty"`
+    ReviewCycle      int               `json:"review_cycle"`
+
+    CreatedAt        time.Time         `json:"created_at"`
+    UpdatedAt        time.Time         `json:"updated_at"`
+    Metadata         map[string]string `json:"metadata,omitempty"` // extensible
+}
+```
+
+### 3.4 TaskState 和 Transition
+
+定义 task 的完整生命周期：
+
+```go
+type TaskState string
+
+const (
+    TaskAssigned      TaskState = "assigned"       // 刚创建，待执行
+    TaskExecuting     TaskState = "executing"       // Worker 正在执行
+    TaskReviewPending TaskState = "review_pending"  // 已完成，等待审核
+    TaskReworkNeeded  TaskState = "rework_needed"   // 审核未过，需返工
+    TaskDone          TaskState = "done"             // 审核通过，已完成
+    TaskCancelled     TaskState = "cancelled"        // 取消
+)
+
+type TaskTransition string
+
+const (
+    TransStart     TaskTransition = "start"      // assigned → executing
+    TransSubmit    TaskTransition = "submit"     // executing → review_pending
+    TransPass      TaskTransition = "pass"       // review_pending → done
+    TransRework    TaskTransition = "rework"     // review_pending → rework_needed
+    TransReassign  TaskTransition = "reassign"   // rework_needed → assigned
+    TransResume    TaskTransition = "resume"     // rework_needed → executing
+    TransCancel    TaskTransition = "cancel"     // any → cancelled
+)
+```
+
+允许的转换仅在 HSM 注册时定义一次，非法转换被引擎拒绝。
+
+### 3.5 Namespace 数据模型
+
+```go
+type Namespace struct {
+    ID        string    `json:"id"`
+    Name      string    `json:"name"`       // goal / project name
+    CreatedAt time.Time `json:"created_at"`
+    UpdatedAt time.Time `json:"updated_at"`
+    Metadata  map[string]string `json:"metadata,omitempty"`
+}
+```
+
+### 3.6 Event History 模型
+
+每次 transition 自动产生一条事件记录：
+
+```go
+type Event struct {
+    TaskID      string    `json:"task_id"`
+    Transition  string    `json:"transition"`
+    FromState   TaskState `json:"from_state"`
+    ToState     TaskState `json:"to_state"`
+    Timestamp   time.Time `json:"timestamp"`
+    Actor       string    `json:"actor,omitempty"`  // who triggered it
+    Reason      string    `json:"reason,omitempty"` // human-readable note
+    Metadata    map[string]string `json:"metadata,omitempty"`
+}
+```
+
+### 3.7 NewEngine 工厂函数
+
+```go
+// NewEngineConfig configures the engine's persistence.
+type NewEngineConfig struct {
+    // SQLite persistence mode
+    DBPath string // ":memory:" for in-memory, or file path
+
+    // Optional: agent-hub sync (see SyncConfig)
+    SyncConfig *SyncConfig
+}
+
+// NewEngine creates and initializes a new engine.
+// It sets up SQLite (auto-creates schema), registers the HSM task state machine,
+// and returns a ready-to-use engine.
+func NewEngine(cfg NewEngineConfig) (*Engine, error)
+```
+
+### 3.8 Hub 同步配置
+
+```go
+type SyncConfig struct {
+    HubMCPEndpoint string // stdio command for the hub MCP server
+    BusinessCode   string
+    WorkerID       string
+    SyncInterval   time.Duration // how often to sync, default 30s
+}
+```
+
+当 `SyncConfig` 为 nil 时，不同步。当非 nil 时，engine 在后台 goroutine 中自动同步状态变更到 agent-hub。
+
+---
+
+## 四、Server 层（pkg/server/）
+
+### 4.1 职责
+
+- 启动 MCP stdio JSON-RPC 2.0 服务器
+- 将 MCP 工具调用映射到 Engine 方法调用
+- 管理 agent 实例的 `workerAgentId` 跨分派续挂
+- 向 agent-company 暴露紧凑的工具接口
+
+### 4.2 MCP 工具定义
+
+Server 层暴露以下 8 个 MCP 工具：
+
+#### Tool 1: `task_create`
+
+在指定 namespace 中创建一个新 task。
+
+```json
+{
+    "name": "task_create",
+    "description": "Create a new task (DAG entry) under a namespace",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "namespace_id": {"type": "string"},
+            "task_id": {"type": "string"},
+            "title": {"type": "string"},
+            "description": {"type": "string"},
+            "assigned_worker": {"type": "string"},
+            "dependencies": {"type": "array", "items": {"type": "string"}},
+            "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+            "output_files": {"type": "array", "items": {"type": "string"}},
+            "metadata": {"type": "object"}
+        },
+        "required": ["namespace_id", "task_id", "title", "assigned_worker"]
+    }
+}
+```
+
+#### Tool 2: `task_transition`
+
+推进一个 task 的状态机。非法转换返回错误。
+
+```json
+{
+    "name": "task_transition",
+    "description": "Advance a task's state machine. Returns error if transition is invalid for current state.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "namespace_id": {"type": "string"},
+            "task_id": {"type": "string"},
+            "transition": {
+                "type": "string",
+                "enum": ["start", "submit", "pass", "rework", "reassign", "resume", "cancel"]
+            },
+            "metadata": {"type": "object", "properties": {
+                "reason": {"type": "string"},
+                "actor": {"type": "string"}
+            }}
+        },
+        "required": ["namespace_id", "task_id", "transition"]
+    }
+}
+```
+
+#### Tool 3: `task_get`
+
+获取 task 的当前状态和所有字段。
+
+```json
+{
+    "name": "task_get",
+    "description": "Get the current state and fields of a task",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "namespace_id": {"type": "string"},
+            "task_id": {"type": "string"}
+        },
+        "required": ["namespace_id", "task_id"]
+    }
+}
+```
+
+#### Tool 4: `task_list`
+
+列出某个 namespace 下的所有 task，可按状态过滤。
+
+```json
+{
+    "name": "task_list",
+    "description": "List tasks in a namespace, optionally filtered by state",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "namespace_id": {"type": "string"},
+            "state_filter": {"type": "string", "description": "optional: comma-separated states"}
+        },
+        "required": ["namespace_id"]
+    }
+}
+```
+
+#### Tool 5: `task_history`
+
+获取一个 task 的完整转换历史。
+
+```json
+{
+    "name": "task_history",
+    "description": "Get the event history (transition log) for a task",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "namespace_id": {"type": "string"},
+            "task_id": {"type": "string"}
+        },
+        "required": ["namespace_id", "task_id"]
+    }
+}
+```
+
+#### Tool 6: `namespace_create`
+
+创建一个新的 namespace（对应 agent-company 的一个 session）。
+
+```json
+{
+    "name": "namespace_create",
+    "description": "Create a new namespace for a session. Returns namespace_id.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "session goal or project name"},
+            "metadata": {"type": "object"}
+        },
+        "required": ["name"]
+    }
+}
+```
+
+#### Tool 7: `namespace_list`
+
+列出所有 namespace（活跃 session）。
+
+```json
+{
+    "name": "namespace_list",
+    "description": "List all namespaces (active sessions)",
+    "inputSchema": {
+        "type": "object",
+        "properties": {}
+    }
+}
+```
+
+#### Tool 8: `flow_ping`
+
+存活检查。
+
+```json
+{
+    "name": "flow_ping",
+    "description": "Health check. Returns engine status and backend info.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {}
+    }
+}
+```
+
+### 4.3 启动方式
+
+agentflow 通过 MCP stdio 模式启动：
+
+```json
+// .mcp.json 配置片段
+{
+    "mcpServers": {
+        "agentflow": {
+            "command": "agentflow",
+            "type": "stdio",
+            "args": ["--db", ":memory:"],
+            "env": {
+                "AGENTFLOW_NAMESPACE": "default"
+            }
+        }
+    }
+}
+```
+
+或者文件模式：
+
+```json
+{
+    "mcpServers": {
+        "agentflow": {
+            "command": "agentflow",
+            "type": "stdio",
+            "args": ["--db", ".mycompany/agentflow.db"]
+        }
+    }
+}
+```
+
+### 4.4 Hub 同步（可选）
+
+当在 env 或 args 中配置了 `--hub-business-code` 时，Server 层在后台启动一个 sync loop：
+
+- 每次有效的 task_transition 后，同步该 task 的新状态到 hub（`hub_sync_dag`）
+- 每 `--hub-sync-interval`（默认 30s）同步一次完整 namespace 状态到 hub
+- 如果 hub 不可用，静默跳过，不阻塞主流程
+- 如果 hub 从未配置，整个 sync loop 不启动
+
+---
+
+## 五、agent-company 集成方式
+
+### 5.1 SKILL.md 改动
+
+在 Phase 0（bootstrap）中，新增一步：
+
+1. 如果 `.mcp.json` 中不存在 `agentflow` server，自动写入配置
+2. 调用 `flow_ping` 验证连通性
+3. 创建初始 namespace，对应当前的 session/goal
+
+### 5.2 Leader prompt 改动
+
+不再需要手动构造 `leader.json` 状态和 `dag[]` 状态机管理。改为：
+
+```
+1. 调用 agentflow.namespace_create 创建当前 session 的 namespace
+2. 对每个 task，调用 agentflow.task_create 创建后写入 DAG
+3. 派发 Worker，setting task_transition(start) 通过 agentflow
+4. 等 Worker 回来，审核后调 task_transition(pass | rework)
+5. 所有状态查询都走 agentflow.task_get / task_list
+```
+
+### 5.3 Worker prompt 改动
+
+Worker 不再需要手动写 session.json 状态持久化。改为：
+
+```
+1. 任务开始时，调 agentflow.task_transition(start)
+2. 任务完成后，调 agentflow.task_transition(submit)
+3. 如果需要继续写 session/experience/diary，通过 agentflow 的任务 metadata 字段记录
+```
+
+---
+
+## 六、未定义区域（后续迭代）
+
+以下功能在 v1 spec 中不定义，留待后续：
+
+### 6.1 资源锁
+
+agent-hub 有 `acquire_lock / release_lock`。agentflow v1 不做锁——它只是一个单进程本地服务，不需要分布式锁。多进程场景（多个 Claude 实例同时编辑同一项目）时再引入。
+
+### 6.2 完整的 Temporal Workflow 语义
+
+agentflow 不暴露 Temporal 的 Timer、Signal、Query、Cron、SideEffect 等特性。这些对 agent-company 的 DAG 管理场景过于复杂。
+
+### 6.3 Playbook 管理
+
+playbook 是 agent-company 自己的 `.mycompany/playbook/` 目录的职责，不进 agentflow。
+
+### 6.4 多人实时协作
+
+多人协作不走 agentflow——仍通过 agent-hub 的 `git push` 分布式锁 + hub 事件同步完成。
+
+---
+
+## 七、与现有 Temporal 源码的关系
+
+agentflow 位于 Temporal 源码树的 `lightweight/` 目录中，**直接使用** Temporal 的 Go 模块：
+
+| Temporal 包 | agentflow 如何使用 |
+|---|---|
+| `common/persistence/sql/sqlplugin/sqlite` | `init()` 注册 SQLite 驱动 |
+| `common/persistence/sql` | `sql.NewFactory()` 创建 store |
+| `common/persistence/serialization` | 序列化/反序列化 |
+| `common/persistence` | `ExecutionStore` 和 `ExecutionManager` 接口 |
+| `service/history/hsm` | 状态机框架（Transition, Node, Registry） |
+| `common/config` | `config.SQL` 结构体 |
+| `common/log` | 日志接口 |
+| `common/metrics` | `NoopMetricsHandler` |
+| `common/resolver` | `NoopResolver` |
+
+计划在未来，当 agentflow 稳定后，可以移出 Temporal 独立为一个仓库。但在迭代阶段，保持在同一模块内是最快的方式。
+
+---
+
+## 八、技术验证状态
+
+| 项目 | 状态 |
+|---|---|
+| 编译（Go 1.26.4, Windows） | ✅ 通过 |
+| SQLite 内存模式启动 | ✅ 通过 |
+| ExecutionStore 创建 | ✅ 通过 |
+| HTTP health 端点 | ✅ 通过 |
+| HSM 集成 | ❌ 待实现（当前 PoC 不含）|
+| Engine API | ❌ 待实现 |
+| MCP Server | ❌ 待实现 |
+| Hub 同步 | ❌ 待实现 |
+| agent-company 集成 | ❌ 待实现 |
+
+---
+
+## 九、附录：状态机转换表
+
+```
+当前状态 \ 转换   | start      submit     pass      rework    reassign  resume    cancel
+─────────────────┼───────────────────────────────────────────────────────────
+assigned         │ executing    ✗         ✗         ✗         ✗         ✗        cancelled
+executing        │   ✗       review_pending ✗       ✗         ✗         ✗        cancelled
+review_pending   │   ✗          ✗        done    rework_needed ✗       ✗        cancelled
+rework_needed    │   ✗          ✗         ✗         ✗       assigned executing  cancelled
+done             │   ✗          ✗         ✗         ✗         ✗         ✗          ✗
+cancelled        │   ✗          ✗         ✗         ✗         ✗         ✗          ✗
+```

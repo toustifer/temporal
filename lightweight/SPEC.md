@@ -474,9 +474,122 @@ agentflow 通过 MCP stdio 模式启动：
 
 ---
 
-## 五、agent-company 集成方式
+## 五、执行协议：Leader 和 Worker 的标准化工作循环
 
-### 5.1 SKILL.md 改动
+agentflow 的状态机定义了 task 的生命周期。但**生命周期怎么驱动**（谁在什么时候做什么事）由一份执行协议定义。
+
+### 6.1 Leader 完整循环
+
+```
+goal 进入
+    │
+    ▼
+1. Leader 拆解需求 → 生成 DAG 任务清单
+2. 调 agentflow.namespace_create 创建 session
+3. 对每个 task 调 agentflow.task_create 创建并写入依赖关系
+4. 调 agentflow.task_transition(start) → 状态变为 executing
+5. 派 Worker（Agent 调用）
+6. Worker 回来后，审核：
+   ├─ 通过 → task_transition(pass)
+   └─ 不通过 → task_transition(rework) → Worker 返工 → 回到 step 6
+7. task 变为 done，从 DAG 移除
+8. 所有 task 都 done 后 → 触发 Worker 汇总总结经验
+9. 写 Leader diary
+```
+
+**关键变化：**
+- Leader 不再手动读写 leader.json 的状态字段
+- Leader 不再自己判断转换是否合法（agentflow 拒绝非法转换）
+- 审核通过后才触发经验总结，不通过不总结
+
+### 6.2 Worker 完整循环
+
+这个问题现在的处理是错误的：**Worker 在第一次代码编译通过后就总结经验，但此时还没有经过审查和测试。**
+
+正确的 Worker 循环应该是：
+
+```
+task 分配下来
+    │
+    ▼
+1. 读上下文：读 playbook、读 domain experience、读相关代码
+2. 分析问题：理解代码结构、根本原因、修改范围
+3. 执行：写代码/改代码
+4. 自验：编译、跑已有测试、验证 acceptance criteria
+5. 提交：调 agentflow.task_transition(submit) → 状态变为 review_pending
+    │
+    ▼ 等待 Leader/Reviewer 审查
+    │
+    ├─ 通过 →
+    │    调 agentflow.task_transition(pass)
+    │
+    └─ 不通过 →
+         调 agentflow.task_transition(rework) → 重新回到 step 1
+          （注意：不是回到 "写代码"，而是回到 "重新分析" — 
+           可能问题不是代码错，而是理解错了需求）
+         └─ 循环直到 leader 判定 pass
+    │
+    ▼ 审查通过后
+         测试验证（集成测试、端到端、回归）
+    │
+    ▼ 测试通过后
+         Worker 总结：这个 task 从初版到最终版经历了什么、学到了什么
+         Worker 更新 domain experience、写 diary
+```
+
+### 6.3 经验总结的时间点（重要）
+
+**现在（错误）：**
+```
+写代码 → 编译通过 → 总结 ← 太早了，返工可能推翻结论
+```
+
+**改为（正确）：**
+```
+写代码 → 审查 → 返工 → 审查通过 → 测试验证通过 → 全链路完成后总结
+```
+
+原因：
+
+1. **第一次的理解可能是错的**。返工过程中可能发现真正的 root cause 和第一版完全不同。如果第一次成功后就已经总结了，返工后的真正结论不会进入经验库。
+
+2. **总结应该覆盖"整条链路"**，不是"第一次写代码的心得"。Worker 在最终通过时最能说清楚：第一条路径为什么失败、第二条路径为什么成功、应该避免什么。
+
+3. **总结不是 Worker 自己的事**。Leader 在审查时也有发现——代码规范、设计决策、遗漏的边界情况。所以最终的经验总结应该是：
+
+```
+Worker 总结：技术层面——我做了什么、踩了什么坑、学到了什么
+Leader 补充：架构层面——这个 task 的设计选择、对整体架构的影响
+两者合并后写入 domain experience
+```
+
+### 6.4 状态流转与总结的对应关系
+
+```
+task 首次 submitting
+    └─ review → pass → [等待全 DAG 完成]
+    └─ review → rework → task 返工循环 → 最终 pass → [等待全 DAG 完成]
+
+当 Namespace 下所有 task 都 done 后：
+    Leader 通知所有涉及 Worker："全链路完成，现在总结"
+    每个 Worker 基于全链路经验写 session / experience / diary
+    Leader 写 diary
+    这个总结才是最终的 team memory
+```
+
+### 6.5 agentflow 对此的支持
+
+agentflow 不直接管"总结"逻辑（那是 agent-company 的知识沉淀层），但它提供触发条件：
+
+- `task_list(namespace_id, state_filter=done)` → 当返回列表 === 全量 task 列表时，Leader 知道可以触发总结了
+- `task_history(task_id)` → 供 Worker 回顾完整返工链路
+- `transition(metadata.reason)` → 记录每次返工的原因，供总结时回顾
+
+---
+
+## 六、agent-company 集成方式
+
+### 6.1 SKILL.md 改动
 
 在 Phase 0（bootstrap）中，新增一步：
 
@@ -484,7 +597,7 @@ agentflow 通过 MCP stdio 模式启动：
 2. 调用 `flow_ping` 验证连通性
 3. 创建初始 namespace，对应当前的 session/goal
 
-### 5.2 Leader prompt 改动
+### 6.2 Leader prompt 改动
 
 不再需要手动构造 `leader.json` 状态和 `dag[]` 状态机管理。改为：
 
@@ -496,7 +609,7 @@ agentflow 通过 MCP stdio 模式启动：
 5. 所有状态查询都走 agentflow.task_get / task_list
 ```
 
-### 5.3 Worker prompt 改动
+### 6.3 Worker prompt 改动
 
 Worker 不再需要手动写 session.json 状态持久化。改为：
 
@@ -508,29 +621,29 @@ Worker 不再需要手动写 session.json 状态持久化。改为：
 
 ---
 
-## 六、未定义区域（后续迭代）
+## 七、未定义区域（后续迭代）
 
 以下功能在 v1 spec 中不定义，留待后续：
 
-### 6.1 资源锁
+### 7.1 资源锁
 
 agent-hub 有 `acquire_lock / release_lock`。agentflow v1 不做锁——它只是一个单进程本地服务，不需要分布式锁。多进程场景（多个 Claude 实例同时编辑同一项目）时再引入。
 
-### 6.2 完整的 Temporal Workflow 语义
+### 7.2 完整的 Temporal Workflow 语义
 
 agentflow 不暴露 Temporal 的 Timer、Signal、Query、Cron、SideEffect 等特性。这些对 agent-company 的 DAG 管理场景过于复杂。
 
-### 6.3 Playbook 管理
+### 7.3 Playbook 管理
 
 playbook 是 agent-company 自己的 `.mycompany/playbook/` 目录的职责，不进 agentflow。
 
-### 6.4 多人实时协作
+### 7.4 多人实时协作
 
 多人协作不走 agentflow——仍通过 agent-hub 的 `git push` 分布式锁 + hub 事件同步完成。
 
 ---
 
-## 七、与现有 Temporal 源码的关系
+## 八、与现有 Temporal 源码的关系
 
 agentflow 位于 Temporal 源码树的 `lightweight/` 目录中，**直接使用** Temporal 的 Go 模块：
 
@@ -550,7 +663,7 @@ agentflow 位于 Temporal 源码树的 `lightweight/` 目录中，**直接使用
 
 ---
 
-## 八、技术验证状态
+## 九、技术验证状态
 
 | 项目 | 状态 |
 |---|---|
@@ -566,7 +679,7 @@ agentflow 位于 Temporal 源码树的 `lightweight/` 目录中，**直接使用
 
 ---
 
-## 九、附录：状态机转换表
+## 十、附录：状态机转换表
 
 ```
 当前状态 \ 转换   | start      submit     pass      rework    reassign  resume    cancel

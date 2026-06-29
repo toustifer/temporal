@@ -261,14 +261,31 @@ type SyncConfig struct {
 
 ### 4.1 职责
 
-- 启动 MCP stdio JSON-RPC 2.0 服务器
+- 启动 MCP stdio JSON-RPC 服务器
 - 将 MCP 工具调用映射到 Engine 方法调用
-- 管理 agent 实例的 `workerAgentId` 跨分派续挂
+- 在每次关键操作后尝试同步 agent-hub
 - 向 agent-company 暴露紧凑的工具接口
 
-### 4.2 MCP 工具定义
+### 4.2 核心边界
 
-Server 层暴露以下 8 个 MCP 工具：
+server 层只做三件事：
+
+1. **协议适配**：把 MCP 请求参数转换成 engine 请求
+2. **结果包装**：把 engine 返回值转成 MCP tool result
+3. **best-effort hub sync**：连上就同步，连不上就跳过，不影响主流程
+
+server 层**不**负责：
+
+- 状态机校验
+- 任务生命周期设计
+- 同步适配器抽象
+- 重试 / 退避 / 任务调度
+
+这些都属于 engine 或外部协作层，不属于 server 的职责。
+
+### 4.3 MCP 工具定义
+
+server 层暴露以下 8 个 MCP 工具：
 
 #### Tool 1: `task_create`
 
@@ -276,23 +293,23 @@ Server 层暴露以下 8 个 MCP 工具：
 
 ```json
 {
-    "name": "task_create",
-    "description": "Create a new task (DAG entry) under a namespace",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "namespace_id": {"type": "string"},
-            "task_id": {"type": "string"},
-            "title": {"type": "string"},
-            "description": {"type": "string"},
-            "assigned_worker": {"type": "string"},
-            "dependencies": {"type": "array", "items": {"type": "string"}},
-            "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-            "output_files": {"type": "array", "items": {"type": "string"}},
-            "metadata": {"type": "object"}
-        },
-        "required": ["namespace_id", "task_id", "title", "assigned_worker"]
-    }
+  "name": "task_create",
+  "description": "Create a new task (DAG entry) under a namespace",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "namespace_id": {"type": "string"},
+      "task_id": {"type": "string"},
+      "title": {"type": "string"},
+      "description": {"type": "string"},
+      "assigned_worker": {"type": "string"},
+      "dependencies": {"type": "array", "items": {"type": "string"}},
+      "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+      "output_files": {"type": "array", "items": {"type": "string"}},
+      "metadata": {"type": "object"}
+    },
+    "required": ["namespace_id", "task_id", "title", "assigned_worker"]
+  }
 }
 ```
 
@@ -302,24 +319,27 @@ Server 层暴露以下 8 个 MCP 工具：
 
 ```json
 {
-    "name": "task_transition",
-    "description": "Advance a task's state machine. Returns error if transition is invalid for current state.",
-    "inputSchema": {
+  "name": "task_transition",
+  "description": "Advance a task's state machine. Returns error if transition is invalid for current state.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "namespace_id": {"type": "string"},
+      "task_id": {"type": "string"},
+      "transition": {
+        "type": "string",
+        "enum": ["start", "submit", "pass", "rework", "reassign", "resume", "cancel"]
+      },
+      "metadata": {
         "type": "object",
         "properties": {
-            "namespace_id": {"type": "string"},
-            "task_id": {"type": "string"},
-            "transition": {
-                "type": "string",
-                "enum": ["start", "submit", "pass", "rework", "reassign", "resume", "cancel"]
-            },
-            "metadata": {"type": "object", "properties": {
-                "reason": {"type": "string"},
-                "actor": {"type": "string"}
-            }}
-        },
-        "required": ["namespace_id", "task_id", "transition"]
-    }
+          "reason": {"type": "string"},
+          "actor": {"type": "string"}
+        }
+      }
+    },
+    "required": ["namespace_id", "task_id", "transition"]
+  }
 }
 ```
 
@@ -327,125 +347,107 @@ Server 层暴露以下 8 个 MCP 工具：
 
 获取 task 的当前状态和所有字段。
 
-```json
-{
-    "name": "task_get",
-    "description": "Get the current state and fields of a task",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "namespace_id": {"type": "string"},
-            "task_id": {"type": "string"}
-        },
-        "required": ["namespace_id", "task_id"]
-    }
-}
-```
-
 #### Tool 4: `task_list`
 
 列出某个 namespace 下的所有 task，可按状态过滤。
-
-```json
-{
-    "name": "task_list",
-    "description": "List tasks in a namespace, optionally filtered by state",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "namespace_id": {"type": "string"},
-            "state_filter": {"type": "string", "description": "optional: comma-separated states"}
-        },
-        "required": ["namespace_id"]
-    }
-}
-```
 
 #### Tool 5: `task_history`
 
 获取一个 task 的完整转换历史。
 
-```json
-{
-    "name": "task_history",
-    "description": "Get the event history (transition log) for a task",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "namespace_id": {"type": "string"},
-            "task_id": {"type": "string"}
-        },
-        "required": ["namespace_id", "task_id"]
-    }
-}
-```
-
 #### Tool 6: `namespace_create`
 
 创建一个新的 namespace（对应 agent-company 的一个 session）。
-
-```json
-{
-    "name": "namespace_create",
-    "description": "Create a new namespace for a session. Returns namespace_id.",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string", "description": "session goal or project name"},
-            "metadata": {"type": "object"}
-        },
-        "required": ["name"]
-    }
-}
-```
 
 #### Tool 7: `namespace_list`
 
 列出所有 namespace（活跃 session）。
 
-```json
-{
-    "name": "namespace_list",
-    "description": "List all namespaces (active sessions)",
-    "inputSchema": {
-        "type": "object",
-        "properties": {}
-    }
-}
-```
-
 #### Tool 8: `flow_ping`
 
 存活检查。
 
+### 4.4 请求/响应约定
+
+#### 成功响应
+
+所有 MCP tool 都返回统一结构：
+
 ```json
 {
-    "name": "flow_ping",
-    "description": "Health check. Returns engine status and backend info.",
-    "inputSchema": {
-        "type": "object",
-        "properties": {}
-    }
+  "ok": true,
+  "data": {}
 }
 ```
 
-### 4.3 启动方式
+`data` 的具体内容由 tool 决定。
+
+#### 错误响应
+
+所有错误都统一为：
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "namespace_not_found",
+    "message": "namespace ns-1 not found",
+    "details": {}
+  }
+}
+```
+
+### 4.5 错误模型
+
+server 层只做协议级错误映射，不吞错：
+
+| 错误码 | 含义 | 来源 |
+|---|---|---|
+| `invalid_request` | 参数缺失 / 类型错误 | MCP 参数校验 |
+| `namespace_not_found` | namespace 不存在 | engine |
+| `task_not_found` | task 不存在 | engine |
+| `duplicate_namespace` | namespace 重复 | engine |
+| `duplicate_task` | task 重复 | engine |
+| `invalid_transition` | 非法状态转换 | engine |
+| `engine_unavailable` | engine 初始化或运行失败 | server |
+| `hub_sync_failed` | hub 同步失败但主流程继续 | best-effort sync |
+
+**原则**：
+- `engine_*` 错误影响当前 tool 调用结果
+- `hub_sync_failed` 不影响 tool 成功与否，只记录日志
+
+### 4.6 Hub best-effort 同步规则
+
+每次下列操作后都尝试同步到 agent-hub：
+
+- `task_create`
+- `task_transition`
+- `task_get`
+- `task_history`
+
+同步策略：
+
+1. 先尝试调用 hub MCP / API
+2. 如果 hub 可达，写入对应的 DAG / event 状态
+3. 如果 hub 不可达或未登录，静默跳过
+4. 不允许 hub 失败阻塞 MCP 返回
+
+### 4.7 启动方式
 
 agentflow 通过 MCP stdio 模式启动：
 
 ```json
-// .mcp.json 配置片段
 {
-    "mcpServers": {
-        "agentflow": {
-            "command": "agentflow",
-            "type": "stdio",
-            "args": ["--db", ":memory:"],
-            "env": {
-                "AGENTFLOW_NAMESPACE": "default"
-            }
-        }
+  "mcpServers": {
+    "agentflow": {
+      "command": "agentflow",
+      "type": "stdio",
+      "args": ["--db", ":memory:"],
+      "env": {
+        "AGENTFLOW_NAMESPACE": "default"
+      }
     }
+  }
 }
 ```
 
@@ -453,24 +455,15 @@ agentflow 通过 MCP stdio 模式启动：
 
 ```json
 {
-    "mcpServers": {
-        "agentflow": {
-            "command": "agentflow",
-            "type": "stdio",
-            "args": ["--db", ".mycompany/agentflow.db"]
-        }
+  "mcpServers": {
+    "agentflow": {
+      "command": "agentflow",
+      "type": "stdio",
+      "args": ["--db", ".mycompany/agentflow.db"]
     }
+  }
 }
 ```
-
-### 4.4 Hub 同步（可选）
-
-当在 env 或 args 中配置了 `--hub-business-code` 时，Server 层在后台启动一个 sync loop：
-
-- 每次有效的 task_transition 后，同步该 task 的新状态到 hub（`hub_sync_dag`）
-- 每 `--hub-sync-interval`（默认 30s）同步一次完整 namespace 状态到 hub
-- 如果 hub 不可用，静默跳过，不阻塞主流程
-- 如果 hub 从未配置，整个 sync loop 不启动
 
 ---
 

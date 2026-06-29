@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -280,16 +281,49 @@ func serveMCP(ctx context.Context, in io.Reader, out io.Writer, srv *lwserver.Se
 }
 
 func decodeRPC(r *bufio.Reader) (*rpcRequest, error) {
-	line, err := r.ReadBytes('\n')
-	if err != nil {
-		return nil, err
+	// Consume any stray blank lines between messages.
+	for {
+		peek, err := r.Peek(1)
+		if err != nil {
+			return nil, err
+		}
+		if peek[0] != '\r' && peek[0] != '\n' {
+			break
+		}
+		r.Discard(1)
 	}
-	if len(strings.TrimSpace(string(line))) == 0 {
-		return decodeRPC(r)
+
+	var contentLength int
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		// Accept both \r\n and \n line endings.
+		line = strings.TrimSuffix(line, "\r\n")
+		line = strings.TrimSuffix(line, "\n")
+		if line == "" {
+			break // end of headers
+		}
+		if strings.HasPrefix(line, "Content-Length:") {
+			n, err := strconv.Atoi(strings.TrimSpace(line[len("Content-Length:"):]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid Content-Length: %w", err)
+			}
+			contentLength = n
+		}
+	}
+	if contentLength <= 0 {
+		return nil, errors.New("missing or empty Content-Length header")
+	}
+
+	body := make([]byte, contentLength)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
 	}
 
 	var req rpcRequest
-	if err := json.Unmarshal(line, &req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, err
 	}
 	return &req, nil
@@ -300,7 +334,11 @@ func encodeRPC(w *bufio.Writer, resp rpcResponse) error {
 	if err != nil {
 		return err
 	}
-	if _, err := w.Write(append(payload, '\n')); err != nil {
+	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(payload))
+	if _, err := w.WriteString(header); err != nil {
+		return err
+	}
+	if _, err := w.Write(payload); err != nil {
 		return err
 	}
 	return w.Flush()

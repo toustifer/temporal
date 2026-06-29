@@ -51,11 +51,28 @@ func (s *Server) Handle(ctx context.Context, tool string, input map[string]any) 
 		s.syncTask(ctx, result.task)
 		return result.payload, nil
 	case "task_get":
-		return s.handleTaskGet(ctx, input)
+		result, err := s.handleTaskGet(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		s.syncTask(ctx, result.task)
+		return result.payload, nil
 	case "task_list":
-		return s.handleTaskList(ctx, input)
+		result, err := s.handleTaskList(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		for i := range result.tasks {
+			s.syncTask(ctx, &result.tasks[i])
+		}
+		return result.payload, nil
 	case "task_history":
-		return s.handleTaskHistory(ctx, input)
+		result, err := s.handleTaskHistory(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		s.syncTask(ctx, result.task)
+		return result.payload, nil
 	case "flow_ping":
 		result := map[string]any{"ok": true}
 		s.syncPing(ctx)
@@ -71,6 +88,16 @@ type namespaceCreateResult struct {
 }
 
 type taskResult struct {
+	task    *engine.Task
+	payload map[string]any
+}
+
+type taskListResult struct {
+	tasks   []engine.Task
+	payload map[string]any
+}
+
+type taskHistoryResult struct {
 	task    *engine.Task
 	payload map[string]any
 }
@@ -152,32 +179,35 @@ func (s *Server) handleTaskTransition(ctx context.Context, input map[string]any)
 	}, nil
 }
 
-func (s *Server) handleTaskGet(ctx context.Context, input map[string]any) (map[string]any, error) {
+func (s *Server) handleTaskGet(ctx context.Context, input map[string]any) (taskResult, error) {
 	namespaceID, err := requiredString(input, "namespace_id")
 	if err != nil {
-		return nil, err
+		return taskResult{}, err
 	}
 	taskID, err := requiredString(input, "task_id")
 	if err != nil {
-		return nil, err
+		return taskResult{}, err
 	}
 
 	task, err := s.engine.GetTask(ctx, namespaceID, taskID)
 	if err != nil {
-		return nil, err
+		return taskResult{}, err
 	}
 
-	return taskToMap(task), nil
+	return taskResult{
+		task:    task,
+		payload: taskToMap(task),
+	}, nil
 }
 
-func (s *Server) handleTaskList(ctx context.Context, input map[string]any) (map[string]any, error) {
+func (s *Server) handleTaskList(ctx context.Context, input map[string]any) (taskListResult, error) {
 	namespaceID, err := requiredString(input, "namespace_id")
 	if err != nil {
-		return nil, err
+		return taskListResult{}, err
 	}
 	states, err := optionalStringSlice(input, "states")
 	if err != nil {
-		return nil, err
+		return taskListResult{}, err
 	}
 
 	filter := engine.StateFilter{States: make(map[engine.TaskState]bool, len(states))}
@@ -190,7 +220,7 @@ func (s *Server) handleTaskList(ctx context.Context, input map[string]any) (map[
 
 	tasks, err := s.engine.ListTasks(ctx, namespaceID, filter)
 	if err != nil {
-		return nil, err
+		return taskListResult{}, err
 	}
 
 	items := make([]any, 0, len(tasks))
@@ -198,22 +228,25 @@ func (s *Server) handleTaskList(ctx context.Context, input map[string]any) (map[
 		items = append(items, taskToMap(&tasks[i]))
 	}
 
-	return map[string]any{"tasks": items}, nil
+	return taskListResult{
+		tasks:   tasks,
+		payload: map[string]any{"tasks": items},
+	}, nil
 }
 
-func (s *Server) handleTaskHistory(ctx context.Context, input map[string]any) (map[string]any, error) {
+func (s *Server) handleTaskHistory(ctx context.Context, input map[string]any) (taskHistoryResult, error) {
 	namespaceID, err := requiredString(input, "namespace_id")
 	if err != nil {
-		return nil, err
+		return taskHistoryResult{}, err
 	}
 	taskID, err := requiredString(input, "task_id")
 	if err != nil {
-		return nil, err
+		return taskHistoryResult{}, err
 	}
 
 	history, err := s.engine.GetHistory(ctx, namespaceID, taskID)
 	if err != nil {
-		return nil, err
+		return taskHistoryResult{}, err
 	}
 
 	items := make([]any, 0, len(history))
@@ -221,7 +254,13 @@ func (s *Server) handleTaskHistory(ctx context.Context, input map[string]any) (m
 		items = append(items, eventToMap(history[i]))
 	}
 
-	return map[string]any{"history": items}, nil
+	// best-effort: fetch task for hub sync (ignore error, syncTask handles nil)
+	task, _ := s.engine.GetTask(ctx, namespaceID, taskID)
+
+	return taskHistoryResult{
+		task:    task,
+		payload: map[string]any{"history": items},
+	}, nil
 }
 
 func decodeCreateTaskRequest(input map[string]any) (engine.CreateTaskRequest, error) {

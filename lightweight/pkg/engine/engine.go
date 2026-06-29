@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -22,9 +23,16 @@ type Engine struct {
 	namespaces map[string]*Namespace
 	tasks      map[string]map[string]*Task
 	history    map[string]map[string][]Event
+	db         *sql.DB // non-nil when SQLite backend is active
 }
 
-type NewEngineConfig struct{}
+type NewEngineConfig struct {
+	// DBPath controls persistence.
+	//   "" (empty)   – pure in-memory maps (current default).
+	//   ":memory:"   – in-memory SQLite (useful for testing).
+	//   "/path/to.db" – persistent SQLite file.
+	DBPath string
+}
 
 type CreateNamespaceRequest struct {
 	ID       string
@@ -106,14 +114,51 @@ const (
 )
 
 func NewEngine(cfg NewEngineConfig) (*Engine, error) {
-	return &Engine{
+	e := &Engine{
 		namespaces: make(map[string]*Namespace),
 		tasks:      make(map[string]map[string]*Task),
 		history:    make(map[string]map[string][]Event),
-	}, nil
+	}
+
+	if cfg.DBPath != "" {
+		db, err := openSQLite(cfg.DBPath)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite init: %w", err)
+		}
+		e.db = db
+
+		// Load existing data so a reopened engine sees prior state.
+		nsMap, err := loadNamespaces(db)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("load namespaces: %w", err)
+		}
+		e.namespaces = nsMap
+
+		taskMap, err := loadTasks(db)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("load tasks: %w", err)
+		}
+		e.tasks = taskMap
+
+		histMap, err := loadHistory(db)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("load history: %w", err)
+		}
+		e.history = histMap
+	}
+
+	return e, nil
 }
 
-func (e *Engine) Close() error { return nil }
+func (e *Engine) Close() error {
+	if e.db != nil {
+		return e.db.Close()
+	}
+	return nil
+}
 
 func (e *Engine) CreateNamespace(ctx context.Context, req CreateNamespaceRequest) (*Namespace, error) {
 	e.mu.Lock()
@@ -137,6 +182,17 @@ func (e *Engine) CreateNamespace(ctx context.Context, req CreateNamespaceRequest
 	e.namespaces[req.ID] = ns
 	e.tasks[req.ID] = make(map[string]*Task)
 	e.history[req.ID] = make(map[string][]Event)
+
+	if e.db != nil {
+		if err := insertNamespace(e.db, ns); err != nil {
+			// Roll back in-memory state on persistence failure.
+			delete(e.namespaces, req.ID)
+			delete(e.tasks, req.ID)
+			delete(e.history, req.ID)
+			return nil, fmt.Errorf("persist namespace: %w", err)
+		}
+	}
+
 	return cloneNamespace(ns), nil
 }
 
@@ -193,7 +249,7 @@ func (e *Engine) CreateTask(ctx context.Context, req CreateTaskRequest) (*Task, 
 		Metadata:          cloneStringMap(req.Metadata),
 	}
 	e.tasks[req.NamespaceID][req.ID] = task
-	e.appendEventLocked(req.NamespaceID, req.ID, Event{
+	ev := Event{
 		TaskID:    req.ID,
 		Transition: string(TransStart),
 		FromState:  TaskAssigned,
@@ -201,7 +257,18 @@ func (e *Engine) CreateTask(ctx context.Context, req CreateTaskRequest) (*Task, 
 		Timestamp:  now,
 		Reason:     "task created",
 		Metadata:   cloneStringMap(req.Metadata),
-	})
+	}
+	e.appendEventLocked(req.NamespaceID, req.ID, ev)
+
+	if e.db != nil {
+		if err := insertTask(e.db, task); err != nil {
+			return nil, fmt.Errorf("persist task: %w", err)
+		}
+		if err := insertEvent(e.db, req.NamespaceID, req.ID, ev); err != nil {
+			return nil, fmt.Errorf("persist event: %w", err)
+		}
+	}
+
 	return cloneTask(task), nil
 }
 
@@ -232,7 +299,7 @@ func (e *Engine) TransitionTask(ctx context.Context, nsID, taskID string, t Task
 		task.Metadata["reason"] = v
 	}
 
-	e.appendEventLocked(nsID, taskID, Event{
+	ev := Event{
 		TaskID:     taskID,
 		Transition: string(t),
 		FromState:  from,
@@ -241,7 +308,18 @@ func (e *Engine) TransitionTask(ctx context.Context, nsID, taskID string, t Task
 		Actor:      meta["actor"],
 		Reason:     meta["reason"],
 		Metadata:   cloneStringMap(meta),
-	})
+	}
+	e.appendEventLocked(nsID, taskID, ev)
+
+	if e.db != nil {
+		if err := updateTask(e.db, task); err != nil {
+			return nil, fmt.Errorf("persist task update: %w", err)
+		}
+		if err := insertEvent(e.db, nsID, taskID, ev); err != nil {
+			return nil, fmt.Errorf("persist event: %w", err)
+		}
+	}
+
 	return cloneTask(task), nil
 }
 

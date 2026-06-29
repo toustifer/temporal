@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -111,6 +112,45 @@ func TestFlowPingReturnsSuccess(t *testing.T) {
 	require.Equal(t, map[string]any{"ok": true}, result)
 }
 
+func TestTaskGetListHistoryReturnCorrectResults(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServer(t)
+	_, err := srv.engine.CreateTask(context.Background(), engine.CreateTaskRequest{
+		NamespaceID:    "ns-1",
+		ID:             "T-list-1",
+		Title:          "first",
+		AssignedWorker: "w1",
+	})
+	require.NoError(t, err)
+	_, err = srv.engine.CreateTask(context.Background(), engine.CreateTaskRequest{
+		NamespaceID:    "ns-1",
+		ID:             "T-list-2",
+		Title:          "second",
+		AssignedWorker: "w2",
+	})
+	require.NoError(t, err)
+
+	// task_list should return all tasks in the namespace
+	listResult, err := srv.Handle(context.Background(), "task_list", map[string]any{
+		"namespace_id": "ns-1",
+	})
+	require.NoError(t, err)
+	items, ok := listResult["tasks"].([]any)
+	require.True(t, ok)
+	require.Len(t, items, 2)
+
+	// task_history should return non-empty history for a created task
+	historyResult, err := srv.Handle(context.Background(), "task_history", map[string]any{
+		"namespace_id": "ns-1",
+		"task_id":      "T-list-1",
+	})
+	require.NoError(t, err)
+	historyItems, ok := historyResult["history"].([]any)
+	require.True(t, ok)
+	require.GreaterOrEqual(t, len(historyItems), 1)
+}
+
 func TestHubSyncFailureDoesNotFailFlowPing(t *testing.T) {
 	t.Parallel()
 
@@ -164,6 +204,141 @@ func TestHubSyncFailureDoesNotFailTaskCreateAndTransition(t *testing.T) {
 	require.Equal(t, "executing", transitioned["state"])
 }
 
+func TestHubSyncFailureDoesNotFailTaskGet(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServerWithConfig(t, Config{HubEnabled: true})
+	srv.hub = failingHubSyncer{err: errors.New("hub unavailable")}
+
+	_, err := srv.engine.CreateTask(context.Background(), engine.CreateTaskRequest{
+		NamespaceID:    "ns-1",
+		ID:             "T-get-fail",
+		Title:          "get with sync failure",
+		AssignedWorker: "w",
+	})
+	require.NoError(t, err)
+
+	result, err := srv.Handle(context.Background(), "task_get", map[string]any{
+		"namespace_id": "ns-1",
+		"task_id":      "T-get-fail",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "T-get-fail", result["id"])
+	require.Equal(t, "get with sync failure", result["title"])
+}
+
+func TestHubSyncFailureDoesNotFailTaskList(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServerWithConfig(t, Config{HubEnabled: true})
+	srv.hub = failingHubSyncer{err: errors.New("hub unavailable")}
+
+	_, err := srv.engine.CreateTask(context.Background(), engine.CreateTaskRequest{
+		NamespaceID:    "ns-1",
+		ID:             "T-list-fail-1",
+		Title:          "list sync fallback",
+		AssignedWorker: "w",
+	})
+	require.NoError(t, err)
+
+	result, err := srv.Handle(context.Background(), "task_list", map[string]any{
+		"namespace_id": "ns-1",
+	})
+	require.NoError(t, err)
+	items, ok := result["tasks"].([]any)
+	require.True(t, ok)
+	require.GreaterOrEqual(t, len(items), 1)
+}
+
+func TestHubSyncFailureDoesNotFailTaskHistory(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServerWithConfig(t, Config{HubEnabled: true})
+	srv.hub = failingHubSyncer{err: errors.New("hub unavailable")}
+
+	_, err := srv.engine.CreateTask(context.Background(), engine.CreateTaskRequest{
+		NamespaceID:    "ns-1",
+		ID:             "T-hist-fail",
+		Title:          "history with sync failure",
+		AssignedWorker: "w",
+	})
+	require.NoError(t, err)
+
+	result, err := srv.Handle(context.Background(), "task_history", map[string]any{
+		"namespace_id": "ns-1",
+		"task_id":      "T-hist-fail",
+	})
+	require.NoError(t, err)
+	items, ok := result["history"].([]any)
+	require.True(t, ok)
+	require.GreaterOrEqual(t, len(items), 1)
+}
+
+func TestTaskGetCallsSyncWithCorrectTask(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServerWithConfig(t, Config{HubEnabled: true})
+	tracker := &trackingHubSyncer{}
+	srv.hub = tracker
+
+	_, err := srv.engine.CreateTask(context.Background(), engine.CreateTaskRequest{
+		NamespaceID:    "ns-1",
+		ID:             "T-sync-check",
+		Title:          "sync verification",
+		AssignedWorker: "w",
+	})
+	require.NoError(t, err)
+
+	result, err := srv.Handle(context.Background(), "task_get", map[string]any{
+		"namespace_id": "ns-1",
+		"task_id":      "T-sync-check",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "T-sync-check", result["id"])
+
+	// verify SyncTask was called with the correct task ID
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	require.Contains(t, tracker.syncedTasks, "T-sync-check")
+}
+
+func TestTaskListCallsSyncForEachTask(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServerWithConfig(t, Config{HubEnabled: true})
+	tracker := &trackingHubSyncer{}
+	srv.hub = tracker
+
+	_, err := srv.engine.CreateTask(context.Background(), engine.CreateTaskRequest{
+		NamespaceID:    "ns-1",
+		ID:             "T-list-sync-1",
+		Title:          "list sync A",
+		AssignedWorker: "w",
+	})
+	require.NoError(t, err)
+	_, err = srv.engine.CreateTask(context.Background(), engine.CreateTaskRequest{
+		NamespaceID:    "ns-1",
+		ID:             "T-list-sync-2",
+		Title:          "list sync B",
+		AssignedWorker: "w",
+	})
+	require.NoError(t, err)
+
+	result, err := srv.Handle(context.Background(), "task_list", map[string]any{
+		"namespace_id": "ns-1",
+	})
+	require.NoError(t, err)
+	items, ok := result["tasks"].([]any)
+	require.True(t, ok)
+	require.Len(t, items, 2)
+
+	// verify SyncTask was called for each task
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	require.Contains(t, tracker.syncedTasks, "T-list-sync-1")
+	require.Contains(t, tracker.syncedTasks, "T-list-sync-2")
+}
+
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	return newTestServerWithConfig(t, Config{})
@@ -201,4 +376,25 @@ func (f failingHubSyncer) SyncNamespace(context.Context, *engine.Namespace) erro
 
 func (f failingHubSyncer) Ping(context.Context) error {
 	return f.err
+}
+
+// trackingHubSyncer records synced task IDs for verification in tests.
+type trackingHubSyncer struct {
+	mu           sync.Mutex
+	syncedTasks  []string
+}
+
+func (t *trackingHubSyncer) SyncTask(_ context.Context, task *engine.Task) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.syncedTasks = append(t.syncedTasks, task.ID)
+	return nil
+}
+
+func (t *trackingHubSyncer) SyncNamespace(_ context.Context, ns *engine.Namespace) error {
+	return nil
+}
+
+func (t *trackingHubSyncer) Ping(_ context.Context) error {
+	return nil
 }
